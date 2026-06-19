@@ -1,17 +1,12 @@
-# OIDC Setup — GitHub Actions IAM Roles
+# OIDC Setup — One-Time AWS Configuration
 
-GitHub Actions deploys to AWS without long-lived access keys by using OIDC.
-The GitHub Actions runner assumes an IAM role via a short-lived token that
-is scoped to a specific branch or tag — it cannot be used by any other workflow.
-
-> **Only the development role is needed right now.**
-> Staging and production role configs are included at the bottom for when those pipelines are enabled.
+All environments (development, staging, production) live in the same AWS account.
+This means the OIDC provider is created **once**, and the same IAM policy template
+is reused for each environment role — just with different resource names.
 
 ---
 
-## Step 1 — Create the GitHub OIDC Identity Provider (once per AWS account)
-
-This only needs to be done **once**, regardless of how many roles you create.
+## Step 1 — Create the OIDC Provider (once, never again)
 
 **AWS Console:** IAM → Identity providers → Add provider
 
@@ -29,18 +24,16 @@ aws iam create-open-id-connect-provider \
   --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
 ```
 
+Done. Never touch this again.
+
 ---
 
-## Step 2 — Create the Development Deploy Role
+## Step 2 — Create One Role Per Environment
 
-**Suggested role name:** `spikesignals-github-deploy-dev`
-
-Replace every `UPPER_CASE` placeholder before pasting.
+Repeat this step 3 times — once for dev, staging, and production.
+The only things that change between roles are highlighted with `← change this`.
 
 ### Trust Policy
-
-Locks this role to pushes on the `development` branch only.
-A workflow on any other branch, tag, or PR cannot assume it.
 
 ```json
 {
@@ -57,7 +50,7 @@ A workflow on any other branch, tag, or PR cannot assume it.
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
         },
         "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:Bright-Access-Consulting-LLC/spikesignals-backend:ref:refs/heads/development"
+          "token.actions.githubusercontent.com:sub": "repo:ORG/REPO:ref:REF_PATTERN"
         }
       }
     }
@@ -65,13 +58,24 @@ A workflow on any other branch, tag, or PR cannot assume it.
 }
 ```
 
-> **Confirm the repo slug casing.** The `sub` condition is case-sensitive.
-> If the GitHub org or repo name differs, update the string above before creating the role.
+Fill in `REF_PATTERN` per environment:
 
-### Permissions Policy
+| Environment | Role name | `REF_PATTERN` |
+|-------------|-----------|---------------|
+| Development | `spikesignals-github-deploy-dev` | `refs/heads/development` |
+| Staging | `spikesignals-github-deploy-staging` | `refs/heads/staging` |
+| Production | `spikesignals-github-deploy-production` | `refs/tags/v*` |
 
-Replace `ACCOUNT_ID`, `CLUSTER_NAME`, `SERVICE_NAME`, `TASK_EXECUTION_ROLE_NAME`,
-and `TASK_ROLE_NAME` with your actual values.
+> Each role can only be assumed by its own branch or tag.
+> A workflow on `development` cannot assume the staging or production role.
+
+---
+
+### Permissions Policy (same for all three roles)
+
+Replace `ACCOUNT_ID`, `CLUSTER_NAME`, `SERVICE_NAME`,
+`TASK_EXECUTION_ROLE_NAME`, and `TASK_ROLE_NAME` with the values
+for that environment before attaching.
 
 ```json
 {
@@ -80,9 +84,7 @@ and `TASK_ROLE_NAME` with your actual values.
     {
       "Sid": "ECRAuth",
       "Effect": "Allow",
-      "Action": [
-        "ecr:GetAuthorizationToken"
-      ],
+      "Action": ["ecr:GetAuthorizationToken"],
       "Resource": "*"
     },
     {
@@ -121,7 +123,7 @@ and `TASK_ROLE_NAME` with your actual values.
         "arn:aws:ecs:us-east-1:ACCOUNT_ID:cluster/CLUSTER_NAME",
         "arn:aws:ecs:us-east-1:ACCOUNT_ID:service/CLUSTER_NAME/SERVICE_NAME",
         "arn:aws:ecs:us-east-1:ACCOUNT_ID:task/CLUSTER_NAME/*",
-        "arn:aws:ecs:us-east-1:ACCOUNT_ID:task-definition/spikesignals-api-dev:*"
+        "arn:aws:ecs:us-east-1:ACCOUNT_ID:task-definition/*"
       ]
     },
     {
@@ -137,85 +139,27 @@ and `TASK_ROLE_NAME` with your actual values.
 }
 ```
 
-> **Why `iam:PassRole` is required:** `aws ecs run-task` and `aws ecs register-task-definition`
-> both require the caller to have permission to "pass" the task execution role and task role
-> to the ECS service. Without this, the API returns `AccessDenied` even when all other
-> ECS permissions are present — and it is one of the most common gotchas when setting this up.
+---
+
+## Step 3 — Add Role ARNs as GitHub Secrets
+
+Once each role is created, copy its ARN into GitHub:
+**Settings → Secrets and variables → Actions**
+
+| Secret name | Value |
+|-------------|-------|
+| `DEV_DEPLOY_ROLE_ARN` | ARN of `spikesignals-github-deploy-dev` |
+| `STAGING_DEPLOY_ROLE_ARN` | ARN of `spikesignals-github-deploy-staging` |
+| `PRODUCTION_DEPLOY_ROLE_ARN` | ARN of `spikesignals-github-deploy-production` |
 
 ---
 
-## Step 3 — Pre-deploy Checklist
+## Full Checklist
 
-Before pushing to `development` for the first time:
-
-- [ ] OIDC provider created in AWS IAM (Step 1)
-- [ ] Dev deploy role created with the trust policy above
-- [ ] `DEV_DEPLOY_ROLE_ARN` secret set in GitHub
-- [ ] All 7 secrets from `GITHUB_SECRETS.md` configured in GitHub
-- [ ] ECR repository `spikesignals-api` exists in the account
-- [ ] Dev ECS cluster, service, and task definition exist (pipeline does not create infrastructure)
-- [ ] `ECS_NETWORK_CONFIG` subnets have outbound internet access via NAT Gateway
-
----
-
-## Staging & Production Roles (add when pipelines are enabled)
-
-### Staging Trust Policy
-
-Same as dev but scoped to the `staging` branch:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-        },
-        "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:Bright-Access-Consulting-LLC/spikesignals-backend:ref:refs/heads/staging"
-        }
-      }
-    }
-  ]
-}
-```
-
-### Production Trust Policy
-
-Scoped to semver tags only — no branch push can assume this role:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
-      },
-      "Action": "sts:AssumeRoleWithWebIdentity",
-      "Condition": {
-        "StringEquals": {
-          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-        },
-        "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:Bright-Access-Consulting-LLC/spikesignals-backend:ref:refs/tags/v*"
-        }
-      }
-    }
-  ]
-}
-```
-
-The permissions policy for staging and production is identical in structure to the dev policy above — substitute the appropriate cluster name, service name, and task definition family name.
-
-> **Production note:** When enabling the production pipeline, also create a `production`
-> GitHub environment (Settings → Environments) with required reviewers configured.
-> This provides the manual approval gate before any production deploy runs.
+- [ ] OIDC provider created in IAM (Step 1 — done once)
+- [ ] Dev role created — trust policy with `refs/heads/development`
+- [ ] Staging role created — trust policy with `refs/heads/staging`
+- [ ] Production role created — trust policy with `refs/tags/v*`
+- [ ] All 3 role ARNs added as GitHub secrets
+- [ ] Remaining secrets from `GITHUB_SECRETS.md` configured
+- [ ] GitHub `production` environment created with required reviewers
