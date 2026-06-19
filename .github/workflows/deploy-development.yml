@@ -47,7 +47,7 @@ env:
 # =============================================================================
 jobs:
   test:
-    name: 🧪 Tests & Static Checks
+    name: Tests & Static Checks
     runs-on: ubuntu-latest
     env:
       DJANGO_SECRET_KEY: "ci-secret-key-placeholder"
@@ -103,31 +103,31 @@ jobs:
           WHATSAPP_ENABLED = False
           SIGNALS_V1_API_ENABLED = False
           EOF
-          echo "✅ Sandboxed local_settings.py generated"
+          echo " Sandboxed local_settings.py generated"
 
       - name: Verify Python Syntax
         run: |
-          echo "🔄 Checking Python syntax across all source files..."
+          echo " Checking Python syntax across all source files..."
           python -m compileall SpikeSignals SpikeSignals_app
-          echo "✅ Syntax check passed"
+          echo " Syntax check passed"
 
       - name: Run Django System Checks
         run: |
-          echo "🔄 Running Django system checks..."
+          echo " Running Django system checks..."
           python manage.py check
-          echo "✅ Django system checks passed"
+          echo " Django system checks passed"
 
       - name: Check for Missing Migrations
         run: |
-          echo "🔄 Checking for unapplied model changes..."
+          echo " Checking for unapplied model changes..."
           python manage.py makemigrations --check --dry-run
-          echo "✅ No missing migrations detected"
+          echo " No missing migrations detected"
 
       - name: Run Test Suite
         run: |
-          echo "🔄 Running pytest..."
+          echo " Running pytest..."
           pytest -q
-          echo "✅ All tests passed"
+          echo " All tests passed"
 
 # =============================================================================
 # JOB 2 — Build & Push Docker Image
@@ -135,7 +135,7 @@ jobs:
 # Outputs the immutable SHA-tagged image URI for downstream jobs.
 # =============================================================================
   build:
-    name: 🐳 Build & Push Image
+    name: Build & Push Image
     runs-on: ubuntu-latest
     needs: test
     outputs:
@@ -159,12 +159,12 @@ jobs:
           IMAGE_URI_SHA: ${{ secrets.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:${{ github.sha }}
           IMAGE_URI_LATEST: ${{ secrets.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:dev-latest
         run: |
-          echo "🔄 Building Docker image from Dockerfile.api..."
+          echo " Building Docker image from Dockerfile.api..."
           docker build -f Dockerfile.api \
             -t "$IMAGE_URI_SHA" \
             -t "$IMAGE_URI_LATEST" \
             .
-          echo "✅ Image built"
+          echo " Image built"
 
       - name: Push Image Tags to ECR
         id: push
@@ -172,11 +172,11 @@ jobs:
           IMAGE_URI_SHA: ${{ secrets.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:${{ github.sha }}
           IMAGE_URI_LATEST: ${{ secrets.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:dev-latest
         run: |
-          echo "🔄 Pushing $IMAGE_URI_SHA..."
+          echo " Pushing $IMAGE_URI_SHA..."
           docker push "$IMAGE_URI_SHA"
-          echo "🔄 Pushing $IMAGE_URI_LATEST..."
+          echo " Pushing $IMAGE_URI_LATEST..."
           docker push "$IMAGE_URI_LATEST"
-          echo "✅ Both tags pushed to ECR"
+          echo " Both tags pushed to ECR"
           echo "image_uri=$IMAGE_URI_SHA" >> "$GITHUB_OUTPUT"
 
 # =============================================================================
@@ -186,7 +186,7 @@ jobs:
 # Outputs the new task definition ARN for downstream jobs.
 # =============================================================================
   register:
-    name: 📋 Register Task Definition
+    name: Register Task Definition
     runs-on: ubuntu-latest
     needs: build
     outputs:
@@ -200,17 +200,20 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Fetch Current Task Definition
+        id: fetch
         run: |
-          echo "🔄 Fetching task definition: ${{ secrets.ECS_TASK_DEF_DEV }}"
-          aws ecs describe-task-definition \
+          echo " Fetching task definition: ${{ secrets.ECS_TASK_DEF_DEV }}"
+          TASK_DEF=$(aws ecs describe-task-definition \
             --task-definition "${{ secrets.ECS_TASK_DEF_DEV }}" \
             --query taskDefinition \
-            --output json > task_def.json
-          echo "✅ Task definition fetched"
+            --output json)
+          # Write to file to avoid shell escaping issues with large JSON
+          echo "$TASK_DEF" > task_def.json
+          echo " Task definition fetched"
 
       - name: Swap Container Image
         run: |
-          echo "🔄 Swapping image to ${{ needs.build.outputs.image_uri }}..."
+          echo " Swapping image to ${{ needs.build.outputs.image_uri }}..."
           jq \
             --arg IMAGE "${{ needs.build.outputs.image_uri }}" \
             '.containerDefinitions[0].image = $IMAGE |
@@ -222,17 +225,17 @@ jobs:
                  .registeredAt,
                  .registeredBy)' \
             task_def.json > new_task_def.json
-          echo "✅ Image swapped"
+          echo " Image swapped"
 
       - name: Register Updated Task Definition
         id: register
         run: |
-          echo "🔄 Registering new task definition revision..."
+          echo " Registering new task definition revision..."
           NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
             --cli-input-json file://new_task_def.json \
             --query taskDefinition.taskDefinitionArn \
             --output text)
-          echo "✅ Registered: $NEW_TASK_DEF_ARN"
+          echo " Registered: $NEW_TASK_DEF_ARN"
           echo "task_def_arn=$NEW_TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
 
 # =============================================================================
@@ -242,7 +245,7 @@ jobs:
 # The ECS service is NOT updated if this job fails.
 # =============================================================================
   migrate:
-    name: 🗄️ Run Migrations
+    name: Run Migrations
     runs-on: ubuntu-latest
     needs: register
 
@@ -256,7 +259,7 @@ jobs:
       - name: Launch Migration Task
         id: launch
         run: |
-          echo "🔄 Launching one-off Fargate task for migrations..."
+          echo " Launching one-off Fargate task for migrations..."
           TASK_ARN=$(aws ecs run-task \
             --cluster "${{ secrets.ECS_CLUSTER_DEV }}" \
             --task-definition "${{ needs.register.outputs.task_def_arn }}" \
@@ -265,16 +268,16 @@ jobs:
             --overrides "{\"containerOverrides\":[{\"name\":\"${{ env.CONTAINER_NAME }}\",\"command\":[\"python\",\"manage.py\",\"migrate\",\"--noinput\"]}]}" \
             --query 'tasks[0].taskArn' \
             --output text)
-          echo "✅ Task launched: $TASK_ARN"
+          echo " Task launched: $TASK_ARN"
           echo "task_arn=$TASK_ARN" >> "$GITHUB_OUTPUT"
 
       - name: Wait for Migration Task to Complete
         run: |
-          echo "🔄 Waiting for migration task to stop..."
+          echo " Waiting for migration task to stop..."
           aws ecs wait tasks-stopped \
             --cluster "${{ secrets.ECS_CLUSTER_DEV }}" \
             --tasks "${{ steps.launch.outputs.task_arn }}"
-          echo "✅ Migration task stopped"
+          echo " Migration task stopped"
 
       - name: Check Migration Exit Code
         run: |
@@ -285,12 +288,12 @@ jobs:
             --output text)
 
           if [ "$EXIT_CODE" != "0" ]; then
-            echo "❌ Migrations failed with exit code $EXIT_CODE — deploy aborted."
+            echo "ERROR: Migrations failed with exit code $EXIT_CODE — deploy aborted."
             echo "Check CloudWatch logs for task: ${{ steps.launch.outputs.task_arn }}"
             exit 1
           fi
 
-          echo "✅ Migrations completed successfully (exit code 0)"
+          echo " Migrations completed successfully (exit code 0)"
 
 # =============================================================================
 # JOB 5 — Deploy to ECS
@@ -298,7 +301,7 @@ jobs:
 # and waits for the service to reach a stable state.
 # =============================================================================
   deploy:
-    name: 🚀 Deploy to ECS
+    name: Deploy to ECS
     runs-on: ubuntu-latest
     needs: migrate
 
@@ -311,22 +314,22 @@ jobs:
 
       - name: Update ECS Service
         run: |
-          echo "🔄 Updating ECS service: ${{ secrets.ECS_SERVICE_DEV }}"
+          echo " Updating ECS service: ${{ secrets.ECS_SERVICE_DEV }}"
           aws ecs update-service \
             --cluster "${{ secrets.ECS_CLUSTER_DEV }}" \
             --service "${{ secrets.ECS_SERVICE_DEV }}" \
             --task-definition "${{ needs.register.outputs.task_def_arn }}" \
             --force-new-deployment \
             --output json > /dev/null
-          echo "✅ ECS service update triggered"
+          echo " ECS service update triggered"
 
       - name: Wait for Service to Stabilise
         run: |
-          echo "🔄 Waiting for service to reach steady state..."
+          echo " Waiting for service to reach steady state..."
           aws ecs wait services-stable \
             --cluster "${{ secrets.ECS_CLUSTER_DEV }}" \
             --services "${{ secrets.ECS_SERVICE_DEV }}"
-          echo "✅ ECS service is stable"
+          echo " ECS service is stable"
 
 # =============================================================================
 # JOB 6 — Smoke Test
@@ -334,7 +337,7 @@ jobs:
 # Fails the pipeline if the service does not respond with HTTP 200.
 # =============================================================================
   smoke-test:
-    name: 💨 Smoke Test
+    name: Smoke Test
     runs-on: ubuntu-latest
     needs: deploy
 
@@ -342,19 +345,19 @@ jobs:
       - name: Health Check with Retry
         run: |
           HEALTH_URL="${{ secrets.DEV_URL }}/health/"
-          echo "🔄 Smoke testing $HEALTH_URL (up to 5 attempts)..."
+          echo " Smoke testing $HEALTH_URL (up to 5 attempts)..."
 
           for i in {1..5}; do
             HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
             if [ "$HTTP_STATUS" = "200" ]; then
-              echo "✅ Smoke test passed on attempt $i (HTTP $HTTP_STATUS)"
+              echo " Smoke test passed on attempt $i (HTTP $HTTP_STATUS)"
               exit 0
             fi
-            echo "🔄 Attempt $i — HTTP $HTTP_STATUS, retrying in 10s..."
+            echo " Attempt $i — HTTP $HTTP_STATUS, retrying in 10s..."
             sleep 10
           done
 
-          echo "❌ Smoke test failed after 5 attempts — last status: $HTTP_STATUS"
+          echo "ERROR: Smoke test failed after 5 attempts — last status: $HTTP_STATUS"
           exit 1
 
 # =============================================================================
@@ -363,7 +366,7 @@ jobs:
 # UI showing what was deployed, by whom, and whether it succeeded.
 # =============================================================================
   summary:
-    name: 📝 Deployment Summary
+    name: Deployment Summary
     runs-on: ubuntu-latest
     needs: [build, register, smoke-test]
     if: always()
@@ -371,6 +374,7 @@ jobs:
     steps:
       - name: Write Summary
         run: |
+          # Determine overall status from smoke-test result
           if [ "${{ needs.smoke-test.result }}" = "success" ]; then
             STATUS="✅ Success"
           elif [ "${{ needs.smoke-test.result }}" = "skipped" ]; then
@@ -380,7 +384,7 @@ jobs:
           fi
 
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
-          ## 🚀 Development Deployment Summary
+          ## Development Deployment Summary
 
           | Field              | Value |
           |--------------------|-------|
