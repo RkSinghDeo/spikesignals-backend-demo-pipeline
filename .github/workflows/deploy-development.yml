@@ -1,0 +1,325 @@
+# =============================================================================
+# deploy-development.yml — SpikeSignals Development CI/CD Pipeline
+#
+# Trigger: every push to the `development` branch
+#
+# Flow:
+#   test ──► deploy
+#   The deploy job only runs if test passes.
+#   A failed test blocks the deploy entirely.
+#
+# Required GitHub Secrets:
+#   DEV_DEPLOY_ROLE_ARN   — IAM role ARN assumed via OIDC for dev deploys
+#   ECR_REGISTRY          — ECR registry hostname (e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com)
+#   ECS_CLUSTER_DEV       — ECS cluster name for development
+#   ECS_SERVICE_DEV       — ECS service name for development
+#   ECS_TASK_DEF_DEV      — ECS task definition family name (no revision suffix)
+#   ECS_NETWORK_CONFIG    — JSON for --network-configuration (subnets + security groups)
+#   DEV_URL               — Base URL for dev smoke test (no trailing slash)
+# =============================================================================
+
+name: CI/CD — Development
+
+on:
+  push:
+    branches:
+      - development
+
+concurrency:
+  group: deploy-development
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  CONTAINER_NAME: spikesignals-api
+  IMAGE_REPO: spikesignals-api
+  PYTHON_VERSION: "3.12"
+
+# =============================================================================
+# JOB 1 — CI: Tests & Static Checks
+# Runs without any AWS credentials. Fails fast before any deploy work begins.
+# =============================================================================
+jobs:
+  test:
+    name: Backend Tests & Static Checks
+    runs-on: ubuntu-latest
+    env:
+      DJANGO_SECRET_KEY: "ci-secret-key-placeholder"
+      POSTHOG_ENABLED: "false"
+      DJANGO_SETTINGS_MODULE: "SpikeSignals.settings_test"
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set Up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          # Locked to 3.12 — channels 3.0.5 imports `cgi` which was removed in Python 3.13
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Inject Sandboxed local_settings.py
+        run: |
+          cat << 'EOF' > SpikeSignals/local_settings.py
+          # CI sandboxed override — replaces all external service connections
+          DATABASES = {
+              'default': {
+                  'ENGINE': 'django.db.backends.sqlite3',
+                  'NAME': ':memory:',
+              }
+          }
+          CHANNEL_LAYERS = {
+              "default": {
+                  "BACKEND": "channels.layers.InMemoryChannelLayer",
+              },
+          }
+          CACHES = {
+              "default": {
+                  "BACKEND": "django.core.cache.backends.dummy.DummyCache",
+              }
+          }
+          EMAIL_BACKEND = 'django.core.mail.backends.locmem.EmailBackend'
+          SECURE_SSL_REDIRECT = False
+          SESSION_COOKIE_SECURE = False
+          CSRF_COOKIE_SECURE = False
+          POSTHOG_ENABLED = False
+          TELECOM_ENFORCEMENT_ENABLED = False
+          TELECOM_DISPATCH_ENABLED = False
+          FCM_ENABLED = False
+          VOICE_ENABLED = False
+          WHATSAPP_ENABLED = False
+          SIGNALS_V1_API_ENABLED = False
+          EOF
+          echo "✅ Sandboxed local_settings.py generated"
+
+      - name: Verify Python Syntax
+        run: |
+          echo "🔄 Checking Python syntax across all source files..."
+          python -m compileall SpikeSignals SpikeSignals_app
+          echo "✅ Syntax check passed"
+
+      - name: Run Django System Checks
+        run: |
+          echo "🔄 Running Django system checks..."
+          python manage.py check
+          echo "✅ Django system checks passed"
+
+      - name: Check for Missing Migrations
+        run: |
+          echo "🔄 Checking for unapplied model changes..."
+          python manage.py makemigrations --check --dry-run
+          echo "✅ No missing migrations detected"
+
+      - name: Run Test Suite
+        run: |
+          echo "🔄 Running pytest..."
+          pytest -q
+          echo "✅ All tests passed"
+
+# =============================================================================
+# JOB 2 — CD: Build, Migrate & Deploy to Development ECS
+# Only runs after `test` passes. Uses AWS OIDC credentials.
+# =============================================================================
+  deploy:
+    name: Deploy to Development ECS
+    runs-on: ubuntu-latest
+    needs: test  # ← test must pass before any deploy work begins
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # AWS credentials via OIDC
+      # -----------------------------------------------------------------------
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEV_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # -----------------------------------------------------------------------
+      # ECR login
+      # -----------------------------------------------------------------------
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # -----------------------------------------------------------------------
+      # Build & push Docker image — SHA tag + dev-latest
+      # -----------------------------------------------------------------------
+      - name: Build and Push Docker Image to ECR
+        id: build-image
+        env:
+          IMAGE_URI_SHA: ${{ secrets.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:${{ github.sha }}
+          IMAGE_URI_LATEST: ${{ secrets.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:dev-latest
+        run: |
+          echo "🔄 Building Docker image from Dockerfile.api..."
+          docker build -f Dockerfile.api \
+            -t "$IMAGE_URI_SHA" \
+            -t "$IMAGE_URI_LATEST" \
+            .
+
+          echo "🔄 Pushing image tags to ECR..."
+          docker push "$IMAGE_URI_SHA"
+          docker push "$IMAGE_URI_LATEST"
+
+          echo "✅ Image pushed: $IMAGE_URI_SHA"
+          echo "image_uri=$IMAGE_URI_SHA" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Fetch task def → swap image → register new revision
+      # -----------------------------------------------------------------------
+      - name: Register New ECS Task Definition
+        id: register-task-def
+        env:
+          NEW_IMAGE_URI: ${{ steps.build-image.outputs.image_uri }}
+        run: |
+          echo "🔄 Fetching current task definition: ${{ secrets.ECS_TASK_DEF_DEV }}"
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition "${{ secrets.ECS_TASK_DEF_DEV }}" \
+            --query taskDefinition \
+            --output json)
+
+          echo "🔄 Swapping container image to $NEW_IMAGE_URI..."
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            --arg IMAGE "$NEW_IMAGE_URI" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn,
+                 .revision,
+                 .status,
+                 .requiresAttributes,
+                 .compatibilities,
+                 .registeredAt,
+                 .registeredBy)')
+
+          echo "🔄 Registering updated task definition..."
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query taskDefinition.taskDefinitionArn \
+            --output text)
+
+          echo "✅ Registered: $NEW_TASK_DEF_ARN"
+          echo "task_def_arn=$NEW_TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Run migrations as a one-off Fargate task — blocks deploy on failure
+      # -----------------------------------------------------------------------
+      - name: Run Django Migrations (One-Off Fargate Task)
+        run: |
+          CLUSTER="${{ secrets.ECS_CLUSTER_DEV }}"
+          TASK_DEF_ARN="${{ steps.register-task-def.outputs.task_def_arn }}"
+
+          echo "🔄 Launching migration task on cluster: $CLUSTER"
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition "$TASK_DEF_ARN" \
+            --launch-type FARGATE \
+            --network-configuration '${{ secrets.ECS_NETWORK_CONFIG }}' \
+            --overrides "{\"containerOverrides\":[{\"name\":\"${{ env.CONTAINER_NAME }}\",\"command\":[\"python\",\"manage.py\",\"migrate\",\"--noinput\"]}]}" \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          echo "🔄 Migration task ARN: $TASK_ARN"
+          echo "🔄 Waiting for migration task to stop..."
+          aws ecs wait tasks-stopped \
+            --cluster "$CLUSTER" \
+            --tasks "$TASK_ARN"
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "$CLUSTER" \
+            --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "❌ Migration task failed with exit code $EXIT_CODE — aborting deploy."
+            echo "Check CloudWatch logs for task: $TASK_ARN"
+            exit 1
+          fi
+
+          echo "✅ Migrations completed successfully (exit code 0)"
+
+      # -----------------------------------------------------------------------
+      # Update ECS service with new task definition
+      # -----------------------------------------------------------------------
+      - name: Update ECS Service with New Task Definition
+        run: |
+          echo "🔄 Updating ECS service: ${{ secrets.ECS_SERVICE_DEV }}"
+          aws ecs update-service \
+            --cluster "${{ secrets.ECS_CLUSTER_DEV }}" \
+            --service "${{ secrets.ECS_SERVICE_DEV }}" \
+            --task-definition "${{ steps.register-task-def.outputs.task_def_arn }}" \
+            --force-new-deployment \
+            --output json > /dev/null
+
+          echo "✅ ECS service update triggered"
+
+      # -----------------------------------------------------------------------
+      # Wait for service to reach steady state
+      # -----------------------------------------------------------------------
+      - name: Wait for ECS Service to Reach Steady State
+        run: |
+          echo "🔄 Waiting for service to stabilise..."
+          aws ecs wait services-stable \
+            --cluster "${{ secrets.ECS_CLUSTER_DEV }}" \
+            --services "${{ secrets.ECS_SERVICE_DEV }}"
+
+          echo "✅ ECS service is stable"
+
+      # -----------------------------------------------------------------------
+      # Smoke test — retry up to 5 times with 10s gaps
+      # -----------------------------------------------------------------------
+      - name: Smoke Test — Health Check
+        run: |
+          HEALTH_URL="${{ secrets.DEV_URL }}/health/"
+          echo "🔄 Running smoke test against $HEALTH_URL"
+
+          for i in {1..5}; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ Smoke test passed on attempt $i (HTTP $HTTP_STATUS)"
+              exit 0
+            fi
+            echo "🔄 Attempt $i failed (HTTP $HTTP_STATUS) — retrying in 10s..."
+            sleep 10
+          done
+
+          echo "❌ Smoke test failed after 5 attempts — last HTTP status: $HTTP_STATUS"
+          exit 1
+
+      # -----------------------------------------------------------------------
+      # Deployment summary
+      # -----------------------------------------------------------------------
+      - name: Write Deployment Summary
+        if: always()
+        run: |
+          STATUS="✅ Success"
+          if [ "${{ job.status }}" != "success" ]; then
+            STATUS="❌ Failed"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
+          ## 🚀 Development Deployment Summary
+
+          | Field              | Value |
+          |--------------------|-------|
+          | **Environment**    | Development |
+          | **Status**         | $STATUS |
+          | **Commit SHA**     | \`${{ github.sha }}\` |
+          | **Author**         | ${{ github.actor }} |
+          | **Image URI**      | \`${{ steps.build-image.outputs.image_uri }}\` |
+          | **Task Definition**| \`${{ steps.register-task-def.outputs.task_def_arn }}\` |
+          | **Branch**         | \`${{ github.ref_name }}\` |
+          EOF
