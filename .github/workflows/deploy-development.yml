@@ -24,6 +24,7 @@ on:
   push:
     branches:
       - development
+  workflow_dispatch:  # allows manual trigger from the GitHub Actions UI
 
 concurrency:
   group: deploy-development
