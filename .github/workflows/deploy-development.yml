@@ -4,9 +4,10 @@
 # Trigger: every push to the `development` branch
 #
 # Flow:
-#   test ──► deploy
-#   The deploy job only runs if test passes.
-#   A failed test blocks the deploy entirely.
+#   test ──► build ──► register ──► migrate ──► deploy ──► smoke-test
+#
+#   Each stage is its own job. A failure at any stage stops the pipeline.
+#   The ECS service is never touched if test, build, register, or migrate fail.
 #
 # Required GitHub Secrets:
 #   DEV_DEPLOY_ROLE_ARN   — IAM role ARN assumed via OIDC for dev deploys
@@ -24,7 +25,7 @@ on:
   push:
     branches:
       - development
-  workflow_dispatch:  # allows manual trigger from the GitHub Actions UI
+  workflow_dispatch:
 
 concurrency:
   group: deploy-development
@@ -41,12 +42,12 @@ env:
   PYTHON_VERSION: "3.12"
 
 # =============================================================================
-# JOB 1 — CI: Tests & Static Checks
-# Runs without any AWS credentials. Fails fast before any deploy work begins.
+# JOB 1 — Tests & Static Checks
+# Runs without AWS credentials. Fails fast before any deploy work begins.
 # =============================================================================
 jobs:
   test:
-    name: Backend Tests & Static Checks
+    name: 🧪 Tests & Static Checks
     runs-on: ubuntu-latest
     env:
       DJANGO_SECRET_KEY: "ci-secret-key-placeholder"
@@ -61,7 +62,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          # Locked to 3.12 — channels 3.0.5 imports `cgi` which was removed in Python 3.13
+          # Locked to 3.12 — channels 3.0.5 imports `cgi` removed in Python 3.13
           cache: "pip"
 
       - name: Install Dependencies
@@ -129,39 +130,31 @@ jobs:
           echo "✅ All tests passed"
 
 # =============================================================================
-# JOB 2 — CD: Build, Migrate & Deploy to Development ECS
-# Only runs after `test` passes. Uses AWS OIDC credentials.
+# JOB 2 — Build & Push Docker Image
+# Builds Dockerfile.api and pushes two tags to ECR.
+# Outputs the immutable SHA-tagged image URI for downstream jobs.
 # =============================================================================
-  deploy:
-    name: Deploy to Development ECS
+  build:
+    name: 🐳 Build & Push Image
     runs-on: ubuntu-latest
-    needs: test  # ← test must pass before any deploy work begins
+    needs: test
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
 
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      # -----------------------------------------------------------------------
-      # AWS credentials via OIDC
-      # -----------------------------------------------------------------------
       - name: Configure AWS Credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.DEV_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # -----------------------------------------------------------------------
-      # ECR login
-      # -----------------------------------------------------------------------
       - name: Login to Amazon ECR
-        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      # -----------------------------------------------------------------------
-      # Build & push Docker image — SHA tag + dev-latest
-      # -----------------------------------------------------------------------
-      - name: Build and Push Docker Image to ECR
-        id: build-image
+      - name: Build Docker Image
         env:
           IMAGE_URI_SHA: ${{ secrets.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:${{ github.sha }}
           IMAGE_URI_LATEST: ${{ secrets.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:dev-latest
@@ -171,31 +164,55 @@ jobs:
             -t "$IMAGE_URI_SHA" \
             -t "$IMAGE_URI_LATEST" \
             .
+          echo "✅ Image built"
 
-          echo "🔄 Pushing image tags to ECR..."
+      - name: Push Image Tags to ECR
+        id: push
+        env:
+          IMAGE_URI_SHA: ${{ secrets.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:${{ github.sha }}
+          IMAGE_URI_LATEST: ${{ secrets.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:dev-latest
+        run: |
+          echo "🔄 Pushing $IMAGE_URI_SHA..."
           docker push "$IMAGE_URI_SHA"
+          echo "🔄 Pushing $IMAGE_URI_LATEST..."
           docker push "$IMAGE_URI_LATEST"
-
-          echo "✅ Image pushed: $IMAGE_URI_SHA"
+          echo "✅ Both tags pushed to ECR"
           echo "image_uri=$IMAGE_URI_SHA" >> "$GITHUB_OUTPUT"
 
-      # -----------------------------------------------------------------------
-      # Fetch task def → swap image → register new revision
-      # -----------------------------------------------------------------------
-      - name: Register New ECS Task Definition
-        id: register-task-def
-        env:
-          NEW_IMAGE_URI: ${{ steps.build-image.outputs.image_uri }}
+# =============================================================================
+# JOB 3 — Register New ECS Task Definition
+# Fetches the current task definition, swaps the container image to the new
+# SHA-tagged URI, strips read-only fields, and registers a new revision.
+# Outputs the new task definition ARN for downstream jobs.
+# =============================================================================
+  register:
+    name: 📋 Register Task Definition
+    runs-on: ubuntu-latest
+    needs: build
+    outputs:
+      task_def_arn: ${{ steps.register.outputs.task_def_arn }}
+
+    steps:
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEV_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch Current Task Definition
         run: |
-          echo "🔄 Fetching current task definition: ${{ secrets.ECS_TASK_DEF_DEV }}"
-          TASK_DEF=$(aws ecs describe-task-definition \
+          echo "🔄 Fetching task definition: ${{ secrets.ECS_TASK_DEF_DEV }}"
+          aws ecs describe-task-definition \
             --task-definition "${{ secrets.ECS_TASK_DEF_DEV }}" \
             --query taskDefinition \
-            --output json)
+            --output json > task_def.json
+          echo "✅ Task definition fetched"
 
-          echo "🔄 Swapping container image to $NEW_IMAGE_URI..."
-          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
-            --arg IMAGE "$NEW_IMAGE_URI" \
+      - name: Swap Container Image
+        run: |
+          echo "🔄 Swapping image to ${{ needs.build.outputs.image_uri }}..."
+          jq \
+            --arg IMAGE "${{ needs.build.outputs.image_uri }}" \
             '.containerDefinitions[0].image = $IMAGE |
              del(.taskDefinitionArn,
                  .revision,
@@ -203,89 +220,129 @@ jobs:
                  .requiresAttributes,
                  .compatibilities,
                  .registeredAt,
-                 .registeredBy)')
+                 .registeredBy)' \
+            task_def.json > new_task_def.json
+          echo "✅ Image swapped"
 
-          echo "🔄 Registering updated task definition..."
+      - name: Register Updated Task Definition
+        id: register
+        run: |
+          echo "🔄 Registering new task definition revision..."
           NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
-            --cli-input-json "$NEW_TASK_DEF" \
+            --cli-input-json file://new_task_def.json \
             --query taskDefinition.taskDefinitionArn \
             --output text)
-
           echo "✅ Registered: $NEW_TASK_DEF_ARN"
           echo "task_def_arn=$NEW_TASK_DEF_ARN" >> "$GITHUB_OUTPUT"
 
-      # -----------------------------------------------------------------------
-      # Run migrations as a one-off Fargate task — blocks deploy on failure
-      # -----------------------------------------------------------------------
-      - name: Run Django Migrations (One-Off Fargate Task)
-        run: |
-          CLUSTER="${{ secrets.ECS_CLUSTER_DEV }}"
-          TASK_DEF_ARN="${{ steps.register-task-def.outputs.task_def_arn }}"
+# =============================================================================
+# JOB 4 — Run Django Migrations
+# Launches a one-off Fargate task using the new task definition.
+# Waits for it to stop and checks the exit code.
+# The ECS service is NOT updated if this job fails.
+# =============================================================================
+  migrate:
+    name: 🗄️ Run Migrations
+    runs-on: ubuntu-latest
+    needs: register
 
-          echo "🔄 Launching migration task on cluster: $CLUSTER"
+    steps:
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEV_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Launch Migration Task
+        id: launch
+        run: |
+          echo "🔄 Launching one-off Fargate task for migrations..."
           TASK_ARN=$(aws ecs run-task \
-            --cluster "$CLUSTER" \
-            --task-definition "$TASK_DEF_ARN" \
+            --cluster "${{ secrets.ECS_CLUSTER_DEV }}" \
+            --task-definition "${{ needs.register.outputs.task_def_arn }}" \
             --launch-type FARGATE \
             --network-configuration '${{ secrets.ECS_NETWORK_CONFIG }}' \
             --overrides "{\"containerOverrides\":[{\"name\":\"${{ env.CONTAINER_NAME }}\",\"command\":[\"python\",\"manage.py\",\"migrate\",\"--noinput\"]}]}" \
             --query 'tasks[0].taskArn' \
             --output text)
+          echo "✅ Task launched: $TASK_ARN"
+          echo "task_arn=$TASK_ARN" >> "$GITHUB_OUTPUT"
 
-          echo "🔄 Migration task ARN: $TASK_ARN"
+      - name: Wait for Migration Task to Complete
+        run: |
           echo "🔄 Waiting for migration task to stop..."
           aws ecs wait tasks-stopped \
-            --cluster "$CLUSTER" \
-            --tasks "$TASK_ARN"
+            --cluster "${{ secrets.ECS_CLUSTER_DEV }}" \
+            --tasks "${{ steps.launch.outputs.task_arn }}"
+          echo "✅ Migration task stopped"
 
+      - name: Check Migration Exit Code
+        run: |
           EXIT_CODE=$(aws ecs describe-tasks \
-            --cluster "$CLUSTER" \
-            --tasks "$TASK_ARN" \
+            --cluster "${{ secrets.ECS_CLUSTER_DEV }}" \
+            --tasks "${{ steps.launch.outputs.task_arn }}" \
             --query 'tasks[0].containers[0].exitCode' \
             --output text)
 
           if [ "$EXIT_CODE" != "0" ]; then
-            echo "❌ Migration task failed with exit code $EXIT_CODE — aborting deploy."
-            echo "Check CloudWatch logs for task: $TASK_ARN"
+            echo "❌ Migrations failed with exit code $EXIT_CODE — deploy aborted."
+            echo "Check CloudWatch logs for task: ${{ steps.launch.outputs.task_arn }}"
             exit 1
           fi
 
           echo "✅ Migrations completed successfully (exit code 0)"
 
-      # -----------------------------------------------------------------------
-      # Update ECS service with new task definition
-      # -----------------------------------------------------------------------
-      - name: Update ECS Service with New Task Definition
+# =============================================================================
+# JOB 5 — Deploy to ECS
+# Updates the ECS service to use the new task definition revision
+# and waits for the service to reach a stable state.
+# =============================================================================
+  deploy:
+    name: 🚀 Deploy to ECS
+    runs-on: ubuntu-latest
+    needs: migrate
+
+    steps:
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DEV_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update ECS Service
         run: |
           echo "🔄 Updating ECS service: ${{ secrets.ECS_SERVICE_DEV }}"
           aws ecs update-service \
             --cluster "${{ secrets.ECS_CLUSTER_DEV }}" \
             --service "${{ secrets.ECS_SERVICE_DEV }}" \
-            --task-definition "${{ steps.register-task-def.outputs.task_def_arn }}" \
+            --task-definition "${{ needs.register.outputs.task_def_arn }}" \
             --force-new-deployment \
             --output json > /dev/null
-
           echo "✅ ECS service update triggered"
 
-      # -----------------------------------------------------------------------
-      # Wait for service to reach steady state
-      # -----------------------------------------------------------------------
-      - name: Wait for ECS Service to Reach Steady State
+      - name: Wait for Service to Stabilise
         run: |
-          echo "🔄 Waiting for service to stabilise..."
+          echo "🔄 Waiting for service to reach steady state..."
           aws ecs wait services-stable \
             --cluster "${{ secrets.ECS_CLUSTER_DEV }}" \
             --services "${{ secrets.ECS_SERVICE_DEV }}"
-
           echo "✅ ECS service is stable"
 
-      # -----------------------------------------------------------------------
-      # Smoke test — retry up to 5 times with 10s gaps
-      # -----------------------------------------------------------------------
-      - name: Smoke Test — Health Check
+# =============================================================================
+# JOB 6 — Smoke Test
+# Hits the /health/ endpoint up to 5 times with 10 second gaps.
+# Fails the pipeline if the service does not respond with HTTP 200.
+# =============================================================================
+  smoke-test:
+    name: 💨 Smoke Test
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+      - name: Health Check with Retry
         run: |
           HEALTH_URL="${{ secrets.DEV_URL }}/health/"
-          echo "🔄 Running smoke test against $HEALTH_URL"
+          echo "🔄 Smoke testing $HEALTH_URL (up to 5 attempts)..."
 
           for i in {1..5}; do
             HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" || echo "000")
@@ -293,21 +350,32 @@ jobs:
               echo "✅ Smoke test passed on attempt $i (HTTP $HTTP_STATUS)"
               exit 0
             fi
-            echo "🔄 Attempt $i failed (HTTP $HTTP_STATUS) — retrying in 10s..."
+            echo "🔄 Attempt $i — HTTP $HTTP_STATUS, retrying in 10s..."
             sleep 10
           done
 
-          echo "❌ Smoke test failed after 5 attempts — last HTTP status: $HTTP_STATUS"
+          echo "❌ Smoke test failed after 5 attempts — last status: $HTTP_STATUS"
           exit 1
 
-      # -----------------------------------------------------------------------
-      # Deployment summary
-      # -----------------------------------------------------------------------
-      - name: Write Deployment Summary
-        if: always()
+# =============================================================================
+# JOB 7 — Deployment Summary
+# Always runs regardless of outcome. Writes a summary to the GitHub Actions
+# UI showing what was deployed, by whom, and whether it succeeded.
+# =============================================================================
+  summary:
+    name: 📝 Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [build, register, smoke-test]
+    if: always()
+
+    steps:
+      - name: Write Summary
         run: |
-          STATUS="✅ Success"
-          if [ "${{ job.status }}" != "success" ]; then
+          if [ "${{ needs.smoke-test.result }}" = "success" ]; then
+            STATUS="✅ Success"
+          elif [ "${{ needs.smoke-test.result }}" = "skipped" ]; then
+            STATUS="⚠️ Skipped (earlier stage failed)"
+          else
             STATUS="❌ Failed"
           fi
 
@@ -320,7 +388,7 @@ jobs:
           | **Status**         | $STATUS |
           | **Commit SHA**     | \`${{ github.sha }}\` |
           | **Author**         | ${{ github.actor }} |
-          | **Image URI**      | \`${{ steps.build-image.outputs.image_uri }}\` |
-          | **Task Definition**| \`${{ steps.register-task-def.outputs.task_def_arn }}\` |
+          | **Image URI**      | \`${{ needs.build.outputs.image_uri }}\` |
+          | **Task Definition**| \`${{ needs.register.outputs.task_def_arn }}\` |
           | **Branch**         | \`${{ github.ref_name }}\` |
           EOF
